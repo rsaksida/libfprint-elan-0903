@@ -1,0 +1,549 @@
+diff --git a/libfprint/drivers/elan.c b/libfprint/drivers/elan.c
+index f9cc52f7..e6ee9a20 100644
+--- a/libfprint/drivers/elan.c
++++ b/libfprint/drivers/elan.c
+@@ -77,6 +77,7 @@ struct _FpiDeviceElan
+   gboolean        deactivating;
+   unsigned char  *last_read;
+   unsigned char   calib_atts_left;
++  unsigned char   settle_atts_left;
+   unsigned char   calib_status;
+   unsigned short *background;
+   unsigned char   frame_width;
+@@ -222,7 +223,7 @@ elan_save_img_frame (FpiDeviceElan *elandev)
+       fp_dbg
+         ("frame darker than background; finger present during calibration?");
+       g_free (frame);
+-      return -1;
++      return (elandev->dev_type & ELAN_PRESS) ? 0 : -1;
+     }
+ 
+   elandev->frames = g_slist_prepend (elandev->frames, frame);
+@@ -314,6 +315,77 @@ elan_process_frame_thirds (unsigned short *raw_frame,
+   *frames = g_slist_prepend (*frames, frame);
+ }
+ 
++static void
++elan_submit_press_image (FpImageDevice *dev)
++{
++  FpiDeviceElan *self = FPI_DEVICE_ELAN (dev);
++  static int press_idx = 0;
++  int width = self->frame_width;
++  int height = self->frame_height;
++  int size = width * height;
++  unsigned short *best = NULL;
++  guint64 best_sharpness = 0;
++  int best_empty = 100;
++  GSList *frames = NULL;
++  GSList *l;
++  FpImage *img;
++
++  G_DEBUG_HERE ();
++
++  press_idx++;
++
++  /* the newest frames are first and may be blurred by the finger lifting */
++  for (l = g_slist_nth (self->frames, ELAN_SKIP_LAST_FRAMES); l; l = l->next)
++    {
++      unsigned short *frame = l->data;
++      guint64 sharpness = 0;
++      int zeros = 0;
++      int empty;
++
++      for (int i = 0; i < size; i++)
++        {
++          if (frame[i] == 0)
++            zeros++;
++          if ((i + 1) % width != 0)
++            sharpness += ABS (frame[i + 1] - frame[i]);
++        }
++
++      empty = zeros * 100 / size;
++      if (empty < best_empty && best_empty > ELAN_PRESS_MAX_EMPTY)
++        {
++          best = frame;
++          best_empty = empty;
++          best_sharpness = sharpness;
++        }
++      else if (empty <= ELAN_PRESS_MAX_EMPTY && sharpness > best_sharpness)
++        {
++          best = frame;
++          best_empty = empty;
++          best_sharpness = sharpness;
++        }
++    }
++
++  fp_dbg ("press %d: %d frames, best empty %d%%, sharpness %" G_GUINT64_FORMAT,
++          press_idx, self->num_frames, best_empty, best_sharpness);
++
++  if (!best || best_empty > ELAN_PRESS_MAX_EMPTY)
++    {
++      fpi_image_device_retry_scan (dev, FP_DEVICE_RETRY_CENTER_FINGER);
++      return;
++    }
++
++  assembling_ctx.frame_width = width;
++  assembling_ctx.frame_height = height;
++  self->process_frame (best, &frames);
++
++  img = fp_image_new (width, height);
++  memcpy (img->data, ((struct fpi_frame *) frames->data)->data, size);
++  img->flags |= FPI_IMAGE_PARTIAL;
++  g_slist_free_full (frames, g_free);
++
++  fpi_image_device_image_captured (dev, img);
++}
++
+ static void
+ elan_submit_image (FpImageDevice *dev)
+ {
+@@ -324,6 +396,12 @@ elan_submit_image (FpImageDevice *dev)
+ 
+   G_DEBUG_HERE ();
+ 
++  if (self->dev_type & ELAN_PRESS)
++    {
++      elan_submit_press_image (dev);
++      return;
++    }
++
+   raw_frames = g_slist_nth (self->frames, ELAN_SKIP_LAST_FRAMES);
+ 
+   assembling_ctx.frame_width = self->frame_width;
+@@ -557,7 +635,7 @@ capture_run_state (FpiSsm *ssm, FpDevice *dev)
+           fpi_image_device_report_finger_status (idev, TRUE);
+           elan_run_cmd (ssm, dev, &get_image_cmd, ELAN_CMD_TIMEOUT);
+         }
+-      else if (self->dev_type == ELAN_0C58 && self->last_read &&
++      else if ((self->dev_type & (ELAN_0C58 | ELAN_PRESS)) && self->last_read &&
+                (self->last_read[0] == 0x00 || self->last_read[0] == 0xaf))
+         {
+           /* 0x00 - not ready
+@@ -733,6 +811,17 @@ calibrate_run_state (FpiSsm *ssm, FpDevice *dev)
+     case CALIBRATE_CHECK_NEEDED:
+       if (elan_need_calibration (self))
+         {
++          /* A background this far off usually means the finger is still on the
++           * sensor. Calibrating now would calibrate against the finger, so give
++           * it time to lift first. */
++          if ((self->dev_type & ELAN_PRESS) && self->settle_atts_left)
++            {
++              self->settle_atts_left -= 1;
++              fp_dbg ("waiting for background to settle, %d attempts left",
++                      self->settle_atts_left);
++              fpi_ssm_jump_to_state_delayed (ssm, CALIBRATE_GET_BACKGROUND, 100);
++              break;
++            }
+           self->calib_status = 0;
+           fpi_ssm_next_state (ssm);
+         }
+@@ -813,6 +902,7 @@ elan_calibrate (FpiDeviceElan *self)
+   g_return_if_fail (!self->active);
+   self->active = TRUE;
+   self->calib_atts_left = ELAN_CALIBRATION_ATTEMPTS (self->dev_type);
++  self->settle_atts_left = ELAN_SETTLE_ATTEMPTS;
+ 
+   FpiSsm *ssm = fpi_ssm_new (FP_DEVICE (self), calibrate_run_state,
+                              CALIBRATE_NUM_STATES);
+@@ -876,7 +966,8 @@ activate_run_state (FpiSsm *ssm, FpDevice *dev)
+           self->frame_height++;
+           self->raw_frame_height = self->frame_height;
+         }
+-      if (self->frame_height > ELAN_MAX_FRAME_HEIGHT)
++      if (!(self->dev_type & ELAN_PRESS) &&
++          self->frame_height > ELAN_MAX_FRAME_HEIGHT)
+         self->frame_height = ELAN_MAX_FRAME_HEIGHT;
+       fp_dbg ("sensor dimensions, WxH: %dx%d", self->frame_width,
+               self->raw_frame_height);
+@@ -934,6 +1025,11 @@ dev_init (FpImageDevice *dev)
+ 
+   /* common params */
+   self->dev_type = fpi_device_get_driver_data (FP_DEVICE (dev));
++  if (self->dev_type & ELAN_PRESS)
++    {
++      fpi_image_device_set_image_match_threshold (dev, ELAN_PRESS_MATCH_THRESHOLD);
++      fpi_device_set_nr_enroll_stages (FP_DEVICE (dev), ELAN_PRESS_ENROLL_STAGES);
++    }
+   self->background = NULL;
+   self->process_frame = elan_process_frame_thirds;
+ 
+diff --git a/libfprint/drivers/elan.h b/libfprint/drivers/elan.h
+index 6bbaae04..91a8a058 100644
+--- a/libfprint/drivers/elan.h
++++ b/libfprint/drivers/elan.h
+@@ -32,6 +32,8 @@
+ #define ELAN_0C03 (1 << 1)
+ #define ELAN_0C42 (1 << 2)
+ #define ELAN_0C58 (1 << 3)
++/* area sensors read with a single press rather than assembled from a swipe */
++#define ELAN_PRESS (1 << 4)
+ 
+ /* devices which don't require frame rotation before assembling */
+ #define ELAN_NOT_ROTATED ELAN_0C03
+@@ -47,7 +49,18 @@
+  * generally prevents calibration from looping indefinitely */
+ #define ELAN_DEFAULT_CALIBRATION_ATTEMPTS 10
+ #define ELAN_CALIBRATION_ATTEMPTS(dev_type) \
+-  ((dev_type) == ELAN_0C58 ? 30 : ELAN_DEFAULT_CALIBRATION_ATTEMPTS)
++  ((dev_type) == ELAN_0C58 ? 30 : \
++   (dev_type) == ELAN_PRESS ? 60 : ELAN_DEFAULT_CALIBRATION_ATTEMPTS)
++
++/* times to re-read the background, 100 ms apart, before recalibrating */
++#define ELAN_SETTLE_ATTEMPTS 20
++
++/* most a press frame may be empty, in percent, before asking for another touch */
++#define ELAN_PRESS_MAX_EMPTY 15
++
++/* press frames hold too few minutiae to match, so compare the images instead */
++#define ELAN_PRESS_MATCH_THRESHOLD 0.70
++#define ELAN_PRESS_ENROLL_STAGES 12
+ 
+ /* min and max frames in a capture */
+ #define ELAN_MIN_FRAMES 7
+@@ -163,7 +176,7 @@ static const struct elan_cmd stop_cmd = {
+ };
+ 
+ static const FpIdEntry elan_id_table[] = {
+-  {.vid = ELAN_VEND_ID,  .pid = 0x0903, .driver_data = ELAN_ALL_DEV},
++  {.vid = ELAN_VEND_ID,  .pid = 0x0903, .driver_data = ELAN_PRESS},
+   {.vid = ELAN_VEND_ID,  .pid = 0x0907, .driver_data = ELAN_0907},
+   {.vid = ELAN_VEND_ID,  .pid = 0x0c01, .driver_data = ELAN_ALL_DEV},
+   {.vid = ELAN_VEND_ID,  .pid = 0x0c02, .driver_data = ELAN_ALL_DEV},
+diff --git a/libfprint/fp-image-device-private.h b/libfprint/fp-image-device-private.h
+index b075634a..eef2bcaa 100644
+--- a/libfprint/fp-image-device-private.h
++++ b/libfprint/fp-image-device-private.h
+@@ -37,6 +37,7 @@ typedef struct
+   FpImage            *capture_image;
+ 
+   gint                bz3_threshold;
++  gdouble             image_match_threshold;
+ } FpImageDevicePrivate;
+ 
+ 
+diff --git a/libfprint/fp-image-device.c b/libfprint/fp-image-device.c
+index ac88ffd9..4c980a34 100644
+--- a/libfprint/fp-image-device.c
++++ b/libfprint/fp-image-device.c
+@@ -125,8 +125,15 @@ fp_image_device_start_capture_action (FpDevice *device)
+ 
+       fpi_device_get_enroll_data (device, &enroll_print);
+       g_object_get (enroll_print, "fpi-type", &print_type, NULL);
+-      if (print_type != FPI_PRINT_NBIS)
+-        fpi_print_set_type (enroll_print, FPI_PRINT_NBIS);
++      if (priv->image_match_threshold > 0)
++        {
++          if (print_type != FPI_PRINT_RAW)
++            fpi_print_set_type (enroll_print, FPI_PRINT_RAW);
++        }
++      else if (print_type != FPI_PRINT_NBIS)
++        {
++          fpi_print_set_type (enroll_print, FPI_PRINT_NBIS);
++        }
+     }
+ 
+   priv->enroll_stage = 0;
+diff --git a/libfprint/fpi-image-device.c b/libfprint/fpi-image-device.c
+index 87bdc600..03223377 100644
+--- a/libfprint/fpi-image-device.c
++++ b/libfprint/fpi-image-device.c
+@@ -263,11 +263,19 @@ fpi_image_device_minutiae_detected (GObject *source_object, GAsyncResult *res, g
+           return;
+         }
+ 
+-      /* Replace error with a retry condition. */
+-      g_warning ("Failed to detect minutiae: %s", error->message);
+-      g_clear_pointer (&error, g_error_free);
++      /* Image matching does not use the minutiae, so too few is not a failure. */
++      if (priv->image_match_threshold > 0)
++        {
++          g_clear_pointer (&error, g_error_free);
++        }
++      else
++        {
++          /* Replace error with a retry condition. */
++          g_warning ("Failed to detect minutiae: %s", error->message);
++          g_clear_pointer (&error, g_error_free);
+ 
+-      error = fpi_device_retry_new_msg (FP_DEVICE_RETRY_GENERAL, "Minutiae detection failed, please retry");
++          error = fpi_device_retry_new_msg (FP_DEVICE_RETRY_GENERAL, "Minutiae detection failed, please retry");
++        }
+     }
+ 
+   action = fpi_device_get_current_action (device);
+@@ -279,7 +287,13 @@ fpi_image_device_minutiae_detected (GObject *source_object, GAsyncResult *res, g
+       return;
+     }
+ 
+-  if (!error)
++  if (!error && priv->image_match_threshold > 0)
++    {
++      print = fp_print_new (device);
++      fpi_print_set_type (print, FPI_PRINT_RAW);
++      fpi_print_add_image (print, image);
++    }
++  else if (!error)
+     {
+       print = fp_print_new (device);
+       fpi_print_set_type (print, FPI_PRINT_NBIS);
+@@ -304,7 +318,10 @@ fpi_image_device_minutiae_detected (GObject *source_object, GAsyncResult *res, g
+ 
+       if (print)
+         {
+-          fpi_print_add_print (enroll_print, print);
++          if (priv->image_match_threshold > 0)
++            fpi_print_add_image (enroll_print, image);
++          else
++            fpi_print_add_print (enroll_print, print);
+           priv->enroll_stage += 1;
+         }
+ 
+@@ -333,13 +350,24 @@ fpi_image_device_minutiae_detected (GObject *source_object, GAsyncResult *res, g
+         {
+           FpPrint *template = g_ptr_array_index (templates, i);
+ 
+-          if (fpi_print_bz3_match (template, print, priv->bz3_threshold, &error) == FPI_MATCH_SUCCESS)
++          FpiMatchResult match;
++
++          if (priv->image_match_threshold > 0)
++            match = fpi_print_image_match (template, print, priv->image_match_threshold, &error);
++          else
++            match = fpi_print_bz3_match (template, print, priv->bz3_threshold, &error);
++
++          if (match == FPI_MATCH_SUCCESS)
+             {
+               result = template;
+               break;
+             }
+         }
+ 
++      /* A scanned image never equals an enrolled one, so it cannot be reported */
++      if (result && priv->image_match_threshold > 0)
++        g_clear_object (&print);
++
+       if (!error || error->domain == FP_DEVICE_RETRY)
+         fpi_device_identify_report (device, result, g_steal_pointer (&print), g_steal_pointer (&error));
+ 
+@@ -360,6 +388,26 @@ fpi_image_device_minutiae_detected (GObject *source_object, GAsyncResult *res, g
+ /*********************************************************/
+ /* Private API */
+ 
++/**
++ * fpi_image_device_set_image_match_threshold:
++ * @self: a #FpImageDevice imaging fingerprint device
++ * @threshold: Normalized correlation needed for a match, in the range (0, 1]
++ *
++ * Makes the device compare images directly rather than minutiae. This is for
++ * sensors whose images are too small to contain enough minutiae to match.
++ */
++void
++fpi_image_device_set_image_match_threshold (FpImageDevice *self,
++                                            gdouble        threshold)
++{
++  FpImageDevicePrivate *priv = fp_image_device_get_instance_private (self);
++
++  g_return_if_fail (FP_IS_IMAGE_DEVICE (self));
++  g_return_if_fail (threshold > 0 && threshold <= 1);
++
++  priv->image_match_threshold = threshold;
++}
++
+ /**
+  * fpi_image_device_set_bz3_threshold:
+  * @self: a #FpImageDevice imaging fingerprint device
+diff --git a/libfprint/fpi-image-device.h b/libfprint/fpi-image-device.h
+index 71472dbb..9e081f93 100644
+--- a/libfprint/fpi-image-device.h
++++ b/libfprint/fpi-image-device.h
+@@ -116,6 +116,8 @@ struct _FpImageDeviceClass
+   void          (*deactivate)   (FpImageDevice *dev);
+ };
+ 
++void fpi_image_device_set_image_match_threshold (FpImageDevice *self,
++                                                 gdouble        threshold);
+ void fpi_image_device_set_bz3_threshold (FpImageDevice *self,
+                                          gint           bz3_threshold);
+ 
+diff --git a/libfprint/fpi-print.c b/libfprint/fpi-print.c
+index 6c5e20db..ec266e04 100644
+--- a/libfprint/fpi-print.c
++++ b/libfprint/fpi-print.c
+@@ -25,6 +25,8 @@
+ #include "fpi-device.h"
+ #include "fpi-compat.h"
+ 
++#include <math.h>
++
+ /**
+  * SECTION: fpi-print
+  * @title: Internal FpPrint
+@@ -210,6 +212,150 @@ fpi_print_add_from_image (FpPrint *print,
+   return TRUE;
+ }
+ 
++#define FPI_PRINT_IMAGES_TYPE G_VARIANT_TYPE ("a(iiay)")
++/* how far apart, in pixels, two presses of the same finger may land */
++#define IMAGE_MATCH_MAX_SHIFT 20
++#define IMAGE_MATCH_SHIFT_STEP 2
++#define IMAGE_MATCH_SAMPLE_STEP 2
++
++/**
++ * fpi_print_add_image:
++ * @print: A #FpPrint of type #FPI_PRINT_RAW
++ * @image: The image to append
++ *
++ * Appends the pixels of @image to the images stored in @print.
++ */
++void
++fpi_print_add_image (FpPrint *print,
++                     FpImage *image)
++{
++  GVariantBuilder builder = G_VARIANT_BUILDER_INIT (FPI_PRINT_IMAGES_TYPE);
++  GVariant *pixels;
++
++  g_return_if_fail (print->type == FPI_PRINT_RAW);
++
++  if (print->data)
++    {
++      GVariantIter iter;
++      GVariant *child;
++
++      g_variant_iter_init (&iter, print->data);
++      while ((child = g_variant_iter_next_value (&iter)))
++        {
++          g_variant_builder_add_value (&builder, child);
++          g_variant_unref (child);
++        }
++    }
++
++  pixels = g_variant_new_fixed_array (G_VARIANT_TYPE_BYTE, image->data,
++                                      image->width * image->height, 1);
++  g_variant_builder_add (&builder, "(ii@ay)", image->width, image->height, pixels);
++
++  g_clear_pointer (&print->data, g_variant_unref);
++  print->data = g_variant_ref_sink (g_variant_builder_end (&builder));
++}
++
++static gdouble
++image_best_correlation (const guint8 *a, const guint8 *b, gint w, gint h)
++{
++  gdouble best = -1;
++
++  for (gint dy = -IMAGE_MATCH_MAX_SHIFT; dy <= IMAGE_MATCH_MAX_SHIFT; dy += IMAGE_MATCH_SHIFT_STEP)
++    for (gint dx = -IMAGE_MATCH_MAX_SHIFT; dx <= IMAGE_MATCH_MAX_SHIFT; dx += IMAGE_MATCH_SHIFT_STEP)
++      {
++        gdouble sum_a = 0, sum_b = 0, sum_aa = 0, sum_bb = 0, sum_ab = 0;
++        gdouble cov, var_a, var_b;
++        gint n = 0;
++
++        for (gint y = MAX (0, -dy); y < MIN (h, h - dy); y += IMAGE_MATCH_SAMPLE_STEP)
++          for (gint x = MAX (0, -dx); x < MIN (w, w - dx); x += IMAGE_MATCH_SAMPLE_STEP)
++            {
++              gdouble pa = a[y * w + x];
++              gdouble pb = b[(y + dy) * w + x + dx];
++
++              sum_a += pa;
++              sum_b += pb;
++              sum_aa += pa * pa;
++              sum_bb += pb * pb;
++              sum_ab += pa * pb;
++              n++;
++            }
++
++        cov = sum_ab - sum_a * sum_b / n;
++        var_a = sum_aa - sum_a * sum_a / n;
++        var_b = sum_bb - sum_b * sum_b / n;
++
++        if (var_a > 0 && var_b > 0)
++          best = MAX (best, cov / sqrt (var_a * var_b));
++      }
++
++  return best;
++}
++
++/**
++ * fpi_print_image_match:
++ * @print_template: A #FpPrint of type #FPI_PRINT_RAW holding the enrolled images
++ * @print: A #FpPrint of type #FPI_PRINT_RAW holding the image to check
++ * @threshold: The correlation needed for a match
++ * @error: Return location for error
++ *
++ * Compares the image in @print to each enrolled image, allowing for the finger
++ * landing in a slightly different place.
++ *
++ * Returns: Whether the prints match, %FPI_MATCH_ERROR on failure
++ */
++FpiMatchResult
++fpi_print_image_match (FpPrint *print_template,
++                       FpPrint *print,
++                       gdouble  threshold,
++                       GError **error)
++{
++  g_autoptr(GVariant) probe = NULL;
++  g_autoptr(GVariant) probe_pixels = NULL;
++  const guint8 *probe_data;
++  gsize probe_len;
++  gint width, height;
++  gdouble best = -1;
++  GVariantIter iter;
++  GVariant *child;
++
++  if (print_template->type != FPI_PRINT_RAW || print->type != FPI_PRINT_RAW ||
++      !print_template->data || !print->data ||
++      !g_variant_is_of_type (print_template->data, FPI_PRINT_IMAGES_TYPE) ||
++      g_variant_n_children (print->data) != 1)
++    {
++      *error = fpi_device_error_new_msg (FP_DEVICE_ERROR_DATA_INVALID,
++                                         "Prints do not hold comparable images");
++      return FPI_MATCH_ERROR;
++    }
++
++  probe = g_variant_get_child_value (print->data, 0);
++  g_variant_get (probe, "(ii@ay)", &width, &height, &probe_pixels);
++  probe_data = g_variant_get_fixed_array (probe_pixels, &probe_len, 1);
++
++  g_variant_iter_init (&iter, print_template->data);
++  while ((child = g_variant_iter_next_value (&iter)))
++    {
++      g_autoptr(GVariant) pixels = NULL;
++      const guint8 *data;
++      gsize len;
++      gint w, h;
++
++      g_variant_get (child, "(ii@ay)", &w, &h, &pixels);
++      data = g_variant_get_fixed_array (pixels, &len, 1);
++
++      if (w == width && h == height && len == probe_len &&
++          len == (gsize) (width * height))
++        best = MAX (best, image_best_correlation (probe_data, data, w, h));
++
++      g_variant_unref (child);
++    }
++
++  fp_dbg ("image match score %.3f, threshold %.3f", best, threshold);
++
++  return best >= threshold ? FPI_MATCH_SUCCESS : FPI_MATCH_FAIL;
++}
++
+ /**
+  * fpi_print_bz3_match:
+  * @print_template: A #FpPrint containing one or more prints
+diff --git a/libfprint/fpi-print.h b/libfprint/fpi-print.h
+index 773407d8..5f0e5916 100644
+--- a/libfprint/fpi-print.h
++++ b/libfprint/fpi-print.h
+@@ -50,6 +50,14 @@ FpiMatchResult fpi_print_bz3_match (FpPrint *print_template,
+                                     gint     bz3_threshold,
+                                     GError **error);
+ 
++void     fpi_print_add_image (FpPrint *print,
++                              FpImage *image);
++
++FpiMatchResult fpi_print_image_match (FpPrint *print_template,
++                                      FpPrint *print,
++                                      gdouble  threshold,
++                                      GError **error);
++
+ /* Helpers to encode metadata into user ID strings. */
+ gchar *  fpi_print_generate_user_id (FpPrint *print);
+ gboolean fpi_print_fill_from_user_id (FpPrint    *print,
