@@ -168,7 +168,7 @@ index f9cc52f7..e6ee9a20 100644
    self->process_frame = elan_process_frame_thirds;
  
 diff --git a/libfprint/drivers/elan.h b/libfprint/drivers/elan.h
-index 6bbaae04..91a8a058 100644
+index 6bbaae04..a24d88b8 100644
 --- a/libfprint/drivers/elan.h
 +++ b/libfprint/drivers/elan.h
 @@ -32,6 +32,8 @@
@@ -195,7 +195,7 @@ index 6bbaae04..91a8a058 100644
 +#define ELAN_PRESS_MAX_EMPTY 15
 +
 +/* press frames hold too few minutiae to match, so compare the images instead */
-+#define ELAN_PRESS_MATCH_THRESHOLD 0.70
++#define ELAN_PRESS_MATCH_THRESHOLD 0.90
 +#define ELAN_PRESS_ENROLL_STAGES 12
  
  /* min and max frames in a capture */
@@ -365,7 +365,7 @@ index 71472dbb..9e081f93 100644
                                           gint           bz3_threshold);
  
 diff --git a/libfprint/fpi-print.c b/libfprint/fpi-print.c
-index 6c5e20db..ec266e04 100644
+index 6c5e20db..28f71358 100644
 --- a/libfprint/fpi-print.c
 +++ b/libfprint/fpi-print.c
 @@ -25,6 +25,8 @@
@@ -377,15 +377,27 @@ index 6c5e20db..ec266e04 100644
  /**
   * SECTION: fpi-print
   * @title: Internal FpPrint
-@@ -210,6 +212,150 @@ fpi_print_add_from_image (FpPrint *print,
+@@ -210,6 +212,335 @@ fpi_print_add_from_image (FpPrint *print,
    return TRUE;
  }
  
 +#define FPI_PRINT_IMAGES_TYPE G_VARIANT_TYPE ("a(iiay)")
-+/* how far apart, in pixels, two presses of the same finger may land */
-+#define IMAGE_MATCH_MAX_SHIFT 20
-+#define IMAGE_MATCH_SHIFT_STEP 2
-+#define IMAGE_MATCH_SAMPLE_STEP 2
++/* how far two presses of the same finger may land apart, in pixels and degrees */
++#define IMAGE_MATCH_MAX_SHIFT 28
++#define IMAGE_MATCH_SHIFT_STEP 3
++#define IMAGE_MATCH_MAX_ROTATION 30
++#define IMAGE_MATCH_ROTATION_STEP 3
++/* every Nth pixel is compared: coarsely to find candidates, then more finely */
++#define IMAGE_MATCH_COARSE_STEP 4
++#define IMAGE_MATCH_FINE_STEP 2
++#define IMAGE_MATCH_CANDIDATES 5
++/* how little of the image must overlap, as a fraction */
++#define IMAGE_MATCH_MIN_OVERLAP 0.35
++#define IMAGE_MATCH_NORMALIZE_RADIUS 6
++/* blocks may move a little on their own, because skin stretches */
++#define IMAGE_MATCH_BLOCK_SIZE 16
++#define IMAGE_MATCH_BLOCK_SLACK 2
++#define IMAGE_MATCH_MIN_BLOCKS 4
 +
 +/**
 + * fpi_print_add_image:
@@ -424,41 +436,199 @@ index 6c5e20db..ec266e04 100644
 +  print->data = g_variant_ref_sink (g_variant_builder_end (&builder));
 +}
 +
-+static gdouble
-+image_best_correlation (const guint8 *a, const guint8 *b, gint w, gint h)
++typedef struct
 +{
-+  gdouble best = -1;
++  gdouble score;
++  gdouble cos_r;
++  gdouble sin_r;
++  gdouble dx;
++  gdouble dy;
++} ImageMatchTransform;
 +
-+  for (gint dy = -IMAGE_MATCH_MAX_SHIFT; dy <= IMAGE_MATCH_MAX_SHIFT; dy += IMAGE_MATCH_SHIFT_STEP)
-+    for (gint dx = -IMAGE_MATCH_MAX_SHIFT; dx <= IMAGE_MATCH_MAX_SHIFT; dx += IMAGE_MATCH_SHIFT_STEP)
++/* Removes the local brightness and contrast, which change with pressure and
++ * how damp the finger is. */
++static void
++image_normalize (const guint8 *in, gfloat *out, gint w, gint h)
++{
++  gint r = IMAGE_MATCH_NORMALIZE_RADIUS;
++
++  for (gint y = 0; y < h; y++)
++    for (gint x = 0; x < w; x++)
 +      {
-+        gdouble sum_a = 0, sum_b = 0, sum_aa = 0, sum_bb = 0, sum_ab = 0;
-+        gdouble cov, var_a, var_b;
++        gdouble sum = 0, sum_sq = 0, mean;
 +        gint n = 0;
 +
-+        for (gint y = MAX (0, -dy); y < MIN (h, h - dy); y += IMAGE_MATCH_SAMPLE_STEP)
-+          for (gint x = MAX (0, -dx); x < MIN (w, w - dx); x += IMAGE_MATCH_SAMPLE_STEP)
++        for (gint v = MAX (y - r, 0); v <= MIN (y + r, h - 1); v++)
++          for (gint u = MAX (x - r, 0); u <= MIN (x + r, w - 1); u++)
 +            {
-+              gdouble pa = a[y * w + x];
-+              gdouble pb = b[(y + dy) * w + x + dx];
++              gdouble p = in[v * w + u];
 +
-+              sum_a += pa;
-+              sum_b += pb;
-+              sum_aa += pa * pa;
-+              sum_bb += pb * pb;
-+              sum_ab += pa * pb;
++              sum += p;
++              sum_sq += p * p;
 +              n++;
 +            }
 +
-+        cov = sum_ab - sum_a * sum_b / n;
-+        var_a = sum_aa - sum_a * sum_a / n;
-+        var_b = sum_bb - sum_b * sum_b / n;
++        mean = sum / n;
++        out[y * w + x] = (in[y * w + x] - mean) / sqrt (MAX (sum_sq / n - mean * mean, 1));
++      }
++}
 +
-+        if (var_a > 0 && var_b > 0)
-+          best = MAX (best, cov / sqrt (var_a * var_b));
++static inline gboolean
++image_transform_point (const ImageMatchTransform *t, gint x, gint y, gint w, gint h,
++                       gdouble ox, gdouble oy, gdouble *u, gdouble *v)
++{
++  gdouble cx = (w - 1) / 2.0;
++  gdouble cy = (h - 1) / 2.0;
++
++  *u = t->cos_r * (x - cx) - t->sin_r * (y - cy) + cx + t->dx + ox;
++  *v = t->sin_r * (x - cx) + t->cos_r * (y - cy) + cy + t->dy + oy;
++
++  return *u >= 0 && *v >= 0 && *u < w - 1 && *v < h - 1;
++}
++
++static inline gdouble
++image_sample (const gfloat *image, gint w, gdouble u, gdouble v)
++{
++  gint ui = (gint) u;
++  gint vi = (gint) v;
++  gdouble fu = u - ui;
++  gdouble fv = v - vi;
++  const gfloat *p = image + vi * w + ui;
++
++  return (1 - fu) * (1 - fv) * p[0] + fu * (1 - fv) * p[1] +
++         (1 - fu) * fv * p[w] + fu * fv * p[w + 1];
++}
++
++/* Normalized correlation of a region of @a against @b under a transform */
++static gdouble
++image_correlate (const gfloat *a, const gfloat *b, gint w, gint h,
++                 const ImageMatchTransform *t, gdouble ox, gdouble oy,
++                 gint x0, gint y0, gint x1, gint y1, gint step, gint min_samples)
++{
++  gdouble sum_a = 0, sum_b = 0, sum_aa = 0, sum_bb = 0, sum_ab = 0;
++  gdouble var_a, var_b;
++  gint n = 0;
++
++  for (gint y = y0; y < y1; y += step)
++    for (gint x = x0; x < x1; x += step)
++      {
++        gdouble u, v, pa, pb;
++
++        if (!image_transform_point (t, x, y, w, h, ox, oy, &u, &v))
++          continue;
++
++        pa = a[y * w + x];
++        pb = image_sample (b, w, u, v);
++        sum_a += pa;
++        sum_b += pb;
++        sum_aa += pa * pa;
++        sum_bb += pb * pb;
++        sum_ab += pa * pb;
++        n++;
 +      }
 +
-+  return best;
++  if (n == 0 || n < min_samples)
++    return -1;
++
++  var_a = sum_aa - sum_a * sum_a / n;
++  var_b = sum_bb - sum_b * sum_b / n;
++  if (var_a <= 0 || var_b <= 0)
++    return -1;
++
++  return (sum_ab - sum_a * sum_b / n) / sqrt (var_a * var_b);
++}
++
++static gdouble
++image_correlate_whole (const gfloat *a, const gfloat *b, gint w, gint h,
++                       const ImageMatchTransform *t, gdouble ox, gdouble oy, gint step)
++{
++  gint samples = ((w + step - 1) / step) * ((h + step - 1) / step);
++
++  return image_correlate (a, b, w, h, t, ox, oy, 0, 0, w, h, step,
++                          (gint) ceil (samples * IMAGE_MATCH_MIN_OVERLAP));
++}
++
++/* Compares two normalized images: finds the best rotation and shift, then
++ * averages the correlation of blocks that may each move slightly from there. */
++static gdouble
++image_best_correlation (const gfloat *a, const gfloat *b, gint w, gint h)
++{
++  ImageMatchTransform candidates[IMAGE_MATCH_CANDIDATES];
++  ImageMatchTransform best = { .score = -2 };
++  gint size = IMAGE_MATCH_BLOCK_SIZE;
++  gint slack = IMAGE_MATCH_BLOCK_SLACK;
++  gdouble total = 0;
++  gint blocks = 0;
++
++  for (gint i = 0; i < IMAGE_MATCH_CANDIDATES; i++)
++    candidates[i].score = -2;
++
++  for (gint r = -IMAGE_MATCH_MAX_ROTATION; r <= IMAGE_MATCH_MAX_ROTATION; r += IMAGE_MATCH_ROTATION_STEP)
++    {
++      ImageMatchTransform t = { .cos_r = cos (r * G_PI / 180), .sin_r = sin (r * G_PI / 180) };
++
++      for (t.dy = -IMAGE_MATCH_MAX_SHIFT; t.dy <= IMAGE_MATCH_MAX_SHIFT; t.dy += IMAGE_MATCH_SHIFT_STEP)
++        for (t.dx = -IMAGE_MATCH_MAX_SHIFT; t.dx <= IMAGE_MATCH_MAX_SHIFT; t.dx += IMAGE_MATCH_SHIFT_STEP)
++          {
++            gint worst = 0;
++
++            t.score = image_correlate_whole (a, b, w, h, &t, 0, 0, IMAGE_MATCH_COARSE_STEP);
++
++            for (gint i = 1; i < IMAGE_MATCH_CANDIDATES; i++)
++              if (candidates[i].score < candidates[worst].score)
++                worst = i;
++            if (t.score > candidates[worst].score)
++              candidates[worst] = t;
++          }
++    }
++
++  for (gint i = 0; i < IMAGE_MATCH_CANDIDATES; i++)
++    {
++      if (candidates[i].score <= -2)
++        continue;
++
++      for (gint oy = -IMAGE_MATCH_SHIFT_STEP; oy <= IMAGE_MATCH_SHIFT_STEP; oy++)
++        for (gint ox = -IMAGE_MATCH_SHIFT_STEP; ox <= IMAGE_MATCH_SHIFT_STEP; ox++)
++          {
++            gdouble score = image_correlate_whole (a, b, w, h, &candidates[i], ox, oy, IMAGE_MATCH_FINE_STEP);
++
++            if (score > best.score)
++              {
++                best = candidates[i];
++                best.score = score;
++                best.dx += ox;
++                best.dy += oy;
++              }
++          }
++    }
++
++  if (best.score <= -2)
++    return -1;
++
++  for (gint y = 0; y + size <= h; y += size)
++    for (gint x = 0; x + size <= w; x += size)
++      {
++        gdouble block_best = -2;
++
++        for (gint oy = -slack; oy <= slack; oy++)
++          for (gint ox = -slack; ox <= slack; ox++)
++            {
++              gdouble score = image_correlate (a, b, w, h, &best, ox, oy, x, y, x + size, y + size, 1,
++                                               size * size * 3 / 4);
++
++              /* image_correlate() returns -1 when too few pixels overlap */
++              if (score > block_best && score > -1)
++                block_best = score;
++            }
++
++        if (block_best > -2)
++          {
++            total += block_best;
++            blocks++;
++          }
++      }
++
++  return blocks >= IMAGE_MATCH_MIN_BLOCKS ? total / blocks : -1;
 +}
 +
 +/**
@@ -469,7 +639,7 @@ index 6c5e20db..ec266e04 100644
 + * @error: Return location for error
 + *
 + * Compares the image in @print to each enrolled image, allowing for the finger
-+ * landing in a slightly different place.
++ * landing in a different place and at a different angle.
 + *
 + * Returns: Whether the prints match, %FPI_MATCH_ERROR on failure
 + */
@@ -481,6 +651,8 @@ index 6c5e20db..ec266e04 100644
 +{
 +  g_autoptr(GVariant) probe = NULL;
 +  g_autoptr(GVariant) probe_pixels = NULL;
++  g_autofree gfloat *probe_norm = NULL;
++  g_autofree gfloat *norm = NULL;
 +  const guint8 *probe_data;
 +  gsize probe_len;
 +  gint width, height;
@@ -502,6 +674,17 @@ index 6c5e20db..ec266e04 100644
 +  g_variant_get (probe, "(ii@ay)", &width, &height, &probe_pixels);
 +  probe_data = g_variant_get_fixed_array (probe_pixels, &probe_len, 1);
 +
++  if (width <= 0 || height <= 0 || probe_len != (gsize) width * height)
++    {
++      *error = fpi_device_error_new_msg (FP_DEVICE_ERROR_DATA_INVALID,
++                                         "Print image has an invalid size");
++      return FPI_MATCH_ERROR;
++    }
++
++  probe_norm = g_new (gfloat, probe_len);
++  norm = g_new (gfloat, probe_len);
++  image_normalize (probe_data, probe_norm, width, height);
++
 +  g_variant_iter_init (&iter, print_template->data);
 +  while ((child = g_variant_iter_next_value (&iter)))
 +    {
@@ -513,9 +696,11 @@ index 6c5e20db..ec266e04 100644
 +      g_variant_get (child, "(ii@ay)", &w, &h, &pixels);
 +      data = g_variant_get_fixed_array (pixels, &len, 1);
 +
-+      if (w == width && h == height && len == probe_len &&
-+          len == (gsize) (width * height))
-+        best = MAX (best, image_best_correlation (probe_data, data, w, h));
++      if (w == width && h == height && len == probe_len)
++        {
++          image_normalize (data, norm, w, h);
++          best = MAX (best, image_best_correlation (probe_norm, norm, w, h));
++        }
 +
 +      g_variant_unref (child);
 +    }

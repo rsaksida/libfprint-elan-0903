@@ -74,6 +74,9 @@ libfprint normally uses. Treat it as a convenience, not as strong protection.
 - **Little test data.** The results below come from one person's fingers. It has
   not been tested against other people's fingers, so the false accept rate is
   unknown.
+- **A thin margin.** Other fingers have scored up to 0.854 against a threshold of
+  0.90. Login systems usually allow several attempts, which gives a wrong finger
+  more chances too.
 - **No liveness detection.** Nothing distinguishes a live finger from a copy.
 - **Enrolled images are stored as is.** Prints in `/var/lib/fprint` contain
   fingerprint images rather than extracted features. Only root can read them,
@@ -97,8 +100,11 @@ Four separate problems stopped this sensor from working:
    frame of a press.
 4. **Too few minutiae.** An 80x80 image has only 0-4 minutiae, so the standard
    matcher scored 0 on every comparison, including the same finger. The patch
-   stores images and compares them by normalized cross-correlation, allowing for
-   shifts of up to 20 pixels. A press must score 0.70 against an enrolled image.
+   stores images and compares them directly. It normalizes local brightness and
+   contrast, searches shifts of up to 28 pixels and rotations of up to 30 degrees,
+   then lets 16x16 blocks each move by up to 2 pixels, because skin stretches. The
+   score is the average block correlation, and a press must reach 0.90 against an
+   enrolled image. A check takes roughly 350 ms against a 12-press enrollment.
 
 All of this is limited to `0903`. The image matcher is a new path in shared code
 (`fpi-image-device.c` and `fpi-print.c`), but it only runs for a device that opts
@@ -106,20 +112,30 @@ in, so other sensors keep their existing behavior.
 
 ## Test results
 
-Single session, 12-press enrollment, right index finger enrolled, on a test build
-that, for this sensor, differed from this patch only in debug logging and image
-dumping:
+All from one person on one machine, enrolling the right index finger.
+
+**Live**, against a 12-press enrollment about 70 minutes old, on a build that
+differed from this patch only in saving images for development:
 
 | Finger | Presses | Result | Score |
 |---|---|---|---|
-| Right index (enrolled) | 10 | 10 matched | 0.926-0.967 |
-| Left index, right middle, right ring, both thumbs | 15 | 15 rejected | 0.09-0.32 |
+| Right index (enrolled) | 8 | 8 matched | 0.953-0.979 |
+| Left index, right middle, right ring, both thumbs | 5 | 5 rejected | 0.54-0.79 |
 
-Presses tend to score lower when they are further removed from the enrollment.
-Comparing images offline against an enrollment made a few minutes earlier gave
-0.60-0.88 for the enrolled finger and up to 0.54 for other fingers, so that gap is
-much narrower. Long-term reliability has not been measured. If matches start
-failing, re-enroll rather than lowering the threshold.
+**Offline**, on captures from four right-index sessions over about 30 minutes,
+moving the hand away between presses. Each session's first 12 presses acted as the
+enrollment, tested against the other sessions and 15 images of other fingers:
+
+| Threshold | Enrolled finger passing (192 checks) | Other fingers passing (60 checks) |
+|---|---|---|
+| 0.85 | 96% | 1 |
+| 0.90 | 92% | 0 |
+| 0.95 | 85% | 0 |
+
+The threshold and search settings were chosen using this same data, so these rates
+may be optimistic. Reliability beyond about an hour has not been measured, nor have
+changes such as cold or very dry fingers. If matches start failing, re-enroll rather
+than lowering the threshold.
 
 ## License
 
